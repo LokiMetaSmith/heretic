@@ -205,10 +205,10 @@ class Model:
 
                 for matrix in matrices:
                     # In-place subtraction is safe as we're not using Autograd.
-                    if self.settings.mode == "remove_inhibitions":
-                        matrix.sub_(weight * (projector @ matrix))
-                    else:
+                    if self.settings.reverse:
                         matrix.add_(weight * (projector @ matrix))
+                    else:
+                        matrix.sub_(weight * (projector @ matrix))
 
     def get_chat(self, prompt: str) -> list[dict[str, str]]:
         return [

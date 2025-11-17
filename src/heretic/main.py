@@ -310,7 +310,7 @@ def run():
             StudyDirection.MINIMIZE,
             (
                 StudyDirection.MAXIMIZE
-                if settings.mode == "increase_inhibitions"
+                if settings.reverse
                 else StudyDirection.MINIMIZE
             ),
         ],
@@ -321,7 +321,7 @@ def run():
     best_trials = sorted(
         study.best_trials,
         key=lambda trial: trial.user_attrs["refusals"],
-        reverse=(settings.mode == "increase_inhibitions"),
+        reverse=settings.reverse,
     )
 
     choices = [
