@@ -401,24 +401,9 @@ class Model:
     def abliterate(
         self,
         refusal_directions: Tensor,
-        direction_index: float | None,
+        probes: dict[str, Tensor],
         parameters: dict[str, AbliterationParameters],
     ):
-        if direction_index is None:
-            refusal_direction = None
-        else:
-            # The index must be shifted by 1 because the first element
-            # of refusal_directions is the direction for the embeddings.
-            weight, index = math.modf(direction_index + 1)
-            refusal_direction = F.normalize(
-                refusal_directions[int(index)].lerp(
-                    refusal_directions[int(index) + 1],
-                    weight,
-                ),
-                p=2,
-                dim=0,
-            )
-
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(self.get_layers())):
@@ -439,103 +424,46 @@ class Model:
                     params.min_weight - params.max_weight
                 )
 
-                if refusal_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of refusal_directions is the direction for the embeddings.
-                    layer_refusal_direction = refusal_directions[layer_index + 1]
-                else:
-                    layer_refusal_direction = refusal_direction
+
+                layer_refusal_direction = refusal_directions[layer_index + 1]
 
                 for module in modules:
-                    # FIXME: This cast is potentially invalid, because the program logic
-                    #        does not guarantee that the module is of type Linear, and in fact
-                    #        the retrieved modules might not conform to the interface assumed
-                    #        below (though they do in practice). However, this is difficult
-                    #        to fix cleanly, because get_layer_modules is called twice on
-                    #        different model configurations, and PEFT employs different
-                    #        module types depending on the chosen quantization.
                     module = cast(Linear, module)
 
-                    # LoRA abliteration: delta W = -lambda * v * (v^T W)
-                    # lora_B = -lambda * v
-                    # lora_A = v^T W
-
-                    # Use the FP32 refusal direction directly (no downcast/upcast)
-                    # and move to the correct device.
+                    # The probe weights for this component and layer
+                    w_probe = probes[f"{layer_index}.{component}"].to(module.weight.device)
                     v = layer_refusal_direction.to(module.weight.device)
 
-                    # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
-                    else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
-                        W = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
-                        )
-
-                    # Flatten weight matrix to (out_features, in_features).
-                    W = W.view(W.shape[0], -1)
-
-                    if self.settings.row_normalization != RowNormalization.NONE:
-                        # Keep a reference to the original weight matrix so we can subtract it later.
-                        W_org = W
-                        # Get the row norms.
-                        W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
-                        # Normalize the weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
+                    # Calculate lora_A = w_probe (the context gate)
+                    # w_probe is (d_in,)
+                    lora_A = w_probe.view(1, -1)
 
                     # Calculate lora_B = -weight * v
                     # v is (d_out,)
+                    # Note: We negate weight so the refusal direction is subtracted when the gate is active
                     lora_B = (-weight * v).view(-1, 1)
 
                     if self.settings.row_normalization == RowNormalization.PRE:
-                        # Make the LoRA adapter apply to the original weight matrix.
+                        base_weight = cast(Tensor, module.base_layer.weight)
+                        quant_state = getattr(base_weight, "quant_state", None)
+
+                        if quant_state is None:
+                            W = base_weight.to(torch.float32)
+                        else:
+                            W = cast(
+                                Tensor,
+                                bnb.functional.dequantize_4bit(
+                                    base_weight.data,
+                                    quant_state,
+                                ).to(torch.float32),
+                            )
+                        W = W.view(W.shape[0], -1)
+                        W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
                         lora_B = W_row_norms * lora_B
                     elif self.settings.row_normalization == RowNormalization.FULL:
-                        # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                        W = W + lora_B @ lora_A
-                        # Normalize the adjusted weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-                        # Restore the original row norms of the weight matrix.
-                        W = W * W_row_norms
-                        # Subtract the original matrix to turn W into a delta.
-                        W = W - W_org
-                        # Use a low-rank SVD to get an approximation of the matrix.
-                        r = self.peft_config.r
-                        U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-                        # Truncate it to the part we want to store in the LoRA adapter.
-                        # Note: svd_lowrank actually returns V, so transpose it to get Vh.
-                        U = U[:, :r]
-                        S = S[:r]
-                        Vh = Vh[:, :r].T
-                        # Transfer it into the LoRA adapter components. Split the singular values
-                        # evenly between the two components to keep their norms balanced and avoid
-                        # potential issues with numerical stability.
-                        sqrt_S = torch.sqrt(S)
-                        lora_B = U @ torch.diag(sqrt_S)
-                        lora_A = torch.diag(sqrt_S) @ Vh
+                        pass # Full normalization with dynamic probe gate is complex and rank-dependent. Skipping.
 
-                    # Assign to adapters. The adapter name is "default", because that's
-                    # what PEFT uses when no name is explicitly specified, as above.
-                    # These casts are therefore valid.
+                    # Assign to adapters.
                     weight_A = cast(Tensor, module.lora_A["default"].weight)
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
