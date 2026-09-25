@@ -19,6 +19,10 @@ class QuantizationMethod(str, Enum):
     BNB_4BIT = "bnb_4bit"
 
 
+class DatasetMode(str, Enum):
+    STATIC = "static"
+    SELF_PLAY = "self_play"
+
 class RowNormalization(str, Enum):
     NONE = "none"
     PRE = "pre"
@@ -339,6 +343,11 @@ class Settings(BaseSettings):
             "ethical boundaries",
         ],
         description="Strings whose presence in a response (case insensitive) identifies the response as a refusal.",
+    )
+
+    dataset_mode: DatasetMode = Field(
+        default=DatasetMode.STATIC,
+        description="Dataset generation mode. 'static' uses fixed seeds, 'self_play' expands them via synthetic rollouts.",
     )
 
     system_prompt: str = Field(

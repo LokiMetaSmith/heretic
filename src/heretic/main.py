@@ -50,8 +50,12 @@ from questionary import Choice, Style
 from rich.table import Table
 from rich.traceback import install
 
+
+from .expansion import generate_self_play_dataset
+from .activation_capture import capture_activations
+from .ridge_probe import train_ridge_probes, precompute_ridge_terms
 from .analyzer import Analyzer
-from .config import QuantizationMethod, Settings
+from .config import QuantizationMethod, Settings, DatasetMode
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .utils import (
@@ -482,6 +486,29 @@ def run():
     if settings.plot_residuals:
         analyzer.plot_residuals()
 
+    print()
+    if settings.dataset_mode == DatasetMode.SELF_PLAY:
+        print("Expanding datasets via synthetic self-play...")
+        all_seeds = good_prompts + bad_prompts
+        self_play_good, self_play_bad = generate_self_play_dataset(model, all_seeds)
+        expanded_good_prompts = good_prompts + self_play_good
+        expanded_bad_prompts = bad_prompts + self_play_bad
+    else:
+        print("Using static dataset mode (no self-play expansion).")
+        expanded_good_prompts = good_prompts
+        expanded_bad_prompts = bad_prompts
+
+    print()
+    print("* Capturing good prompt activations...")
+    good_captures = capture_activations(model, expanded_good_prompts)
+    print("* Capturing bad prompt activations...")
+    bad_captures = capture_activations(model, expanded_bad_prompts)
+
+    print("* Precomputing probe matrices...")
+    precomputed_terms = precompute_ridge_terms(good_captures, bad_captures)
+
+    del good_captures, bad_captures
+
     # We don't need the residuals after computing refusal directions.
     del good_residuals, bad_residuals, analyzer
     empty_cache()
@@ -495,51 +522,29 @@ def run():
         trial_index += 1
         trial.set_user_attr("index", trial_index)
 
-        direction_scope = trial.suggest_categorical(
-            "direction_scope",
-            [
-                "global",
-                "per layer",
-            ],
-        )
+        parameters = {}
+        ridge_alpha = trial.suggest_float("ridge_alpha", 0.1, 10.0, log=True)
+        trial.set_user_attr("ridge_alpha", ridge_alpha)
+
+        # Train probes with suggested alpha
+        probes = train_ridge_probes(precomputed_terms, alpha=ridge_alpha)
 
         last_layer_index = len(model.get_layers()) - 1
 
-        # Discrimination between "harmful" and "harmless" inputs is usually strongest
-        # in layers slightly past the midpoint of the layer stack. See the original
-        # abliteration paper (https://arxiv.org/abs/2406.11717) for a deeper analysis.
-        #
-        # Note that we always sample this parameter even though we only need it for
-        # the "global" direction scope. The reason is that multivariate TPE doesn't
-        # work with conditional or variable-range parameters.
-        direction_index = trial.suggest_float(
-            "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
-        )
-
-        if direction_scope == "per layer":
-            direction_index = None
-
-        parameters = {}
-
         for component in model.get_abliterable_components():
-            # The parameter ranges are based on experiments with various models
-            # and much wider ranges. They are not set in stone and might have to be
-            # adjusted for future models.
             max_weight = trial.suggest_float(
                 f"{component}.max_weight",
                 0.8,
-                1.5,
+                2.5,
             )
+            # The gate probe determines layer importance inherently by the magnitude of w_probe.
+            # So we don't strictly need max_weight_position and distance, but keeping them allows
+            # Optuna to find layer-dependent scaling if the probe's natural scale is suboptimal.
             max_weight_position = trial.suggest_float(
                 f"{component}.max_weight_position",
-                0.6 * last_layer_index,
+                0.0 * last_layer_index,
                 1.0 * last_layer_index,
             )
-            # For sampling purposes, min_weight is expressed as a fraction of max_weight,
-            # again because multivariate TPE doesn't support variable-range parameters.
-            # The value is transformed into the actual min_weight value below.
             min_weight = trial.suggest_float(
                 f"{component}.min_weight",
                 0.0,
@@ -548,7 +553,7 @@ def run():
             min_weight_distance = trial.suggest_float(
                 f"{component}.min_weight_distance",
                 1.0,
-                0.6 * last_layer_index,
+                1.0 * last_layer_index,
             )
 
             parameters[component] = AbliterationParameters(
@@ -558,6 +563,8 @@ def run():
                 min_weight_distance=min_weight_distance,
             )
 
+        # Direction index is obsolete since we use per-layer refusal directions
+        direction_index = None
         trial.set_user_attr("direction_index", direction_index)
         trial.set_user_attr("parameters", {k: asdict(v) for k, v in parameters.items()})
 
@@ -568,10 +575,11 @@ def run():
         print("* Parameters:")
         for name, value in get_trial_parameters(trial).items():
             print(f"  * {name} = [bold]{value}[/]")
+        print(f"  * ridge_alpha = [bold]{ridge_alpha:.2f}[/]")
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(refusal_directions, probes, parameters)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
 
@@ -753,9 +761,10 @@ def run():
             print("* Resetting model...")
             model.reset_model()
             print("* Abliterating...")
+            best_probes = train_ridge_probes(precomputed_terms, alpha=trial.user_attrs["ridge_alpha"])
             model.abliterate(
                 refusal_directions,
-                trial.user_attrs["direction_index"],
+                best_probes,
                 {
                     k: AbliterationParameters(**v)
                     for k, v in trial.user_attrs["parameters"].items()
